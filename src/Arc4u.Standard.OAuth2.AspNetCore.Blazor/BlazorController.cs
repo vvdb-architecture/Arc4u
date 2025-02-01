@@ -29,8 +29,6 @@ namespace Arc4u.Blazor;
 [ProducesResponseType(typeof(IEnumerable<Message>), StatusCodes.Status400BadRequest)]
 public class BlazorController : ControllerBase
 {
-    #region Fields & Constants
-
     // The buffer size is set to 1024 bytes.
     private const int Buffer = 1024;
 
@@ -44,10 +42,6 @@ public class BlazorController : ControllerBase
     private readonly ILogger<BlazorController> _logger;
     private readonly string _rootServiceUrl;
 
-    #endregion
-
-    #region Constructor
-
     /// <summary>
     /// Default constructor
     /// </summary>
@@ -58,10 +52,6 @@ public class BlazorController : ControllerBase
         _rootServiceUrl = configuration[RootServiceUrlKey] ?? throw new InvalidOperationException($"The root service URL is not defined in the configuration {RootServiceUrlKey}!");
     }
 
-    #endregion
-
-    #region Actions
-
     /// <summary>
     /// This action is used to redirect the user to the Blazor application after having retrieved his/her access token.
     /// </summary>
@@ -70,7 +60,7 @@ public class BlazorController : ControllerBase
     [HttpGet("redirectTo/{redirectTo}/{id?}")]
     public async Task<IActionResult> Get(int? id, string redirectTo, [FromServices] IApplicationContext applicationContext, [FromServices] IContainerResolve containerResolve, [FromServices] ILogger<BlazorController> logger)
     {
-        if (applicationContext.Principal.Authorization.Operations.Count == 0)
+        if (applicationContext.Principal is null || applicationContext.Principal.Authorization.Operations.Count == 0)
         {
             _logger.LogWarning("The user is not identified!");
             return Unauthorized();
@@ -90,7 +80,7 @@ public class BlazorController : ControllerBase
             {
                 if (containerResolve.TryResolve<ITokenProvider>(ProviderId, out var tokenProvider))
                 {
-                    accessToken = (await tokenProvider.GetTokenAsync(_settings, claimsIdentity).ConfigureAwait(false)).Token;
+                    accessToken = (await tokenProvider!.GetTokenAsync(_settings, claimsIdentity).ConfigureAwait(false))?.Token;
                 }
             }
         }
@@ -116,6 +106,4 @@ public class BlazorController : ControllerBase
             return Redirect($"{redirectUri}?token={accessToken.Substring((index - 1) * Buffer, accessToken.Length - (index - 1) * Buffer)}");
         }
     }
-
-    #endregion
 }

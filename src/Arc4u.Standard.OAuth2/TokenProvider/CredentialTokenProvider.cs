@@ -6,7 +6,6 @@ using Arc4u.OAuth2.Options;
 using Arc4u.OAuth2.Security.Principal;
 using Arc4u.OAuth2.Token;
 using Arc4u.ServiceModel;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -17,17 +16,15 @@ public class CredentialTokenProvider : ICredentialTokenProvider
 {
     public const string ProviderName = "CredentialDirect";
 
-    private static readonly TimeSpan DefaultSTSRetry = TimeSpan.FromSeconds(90);
+    private static readonly TimeSpan DefaultRetryInterval = TimeSpan.FromSeconds(90);
 
     private readonly ILogger<CredentialTokenProvider> _logger;
     private readonly IOptionsMonitor<AuthorityOptions> _authorityOptions;
-    private readonly TimeSpan _stsRetry;
 
-    public CredentialTokenProvider(ILogger<CredentialTokenProvider> logger, IOptionsMonitor<AuthorityOptions> authorityOptions, IConfiguration configuration)
+    public CredentialTokenProvider(ILogger<CredentialTokenProvider> logger, IOptionsMonitor<AuthorityOptions> authorityOptions)
     {
         _logger = logger;
         _authorityOptions = authorityOptions;
-        _stsRetry = configuration.GetValue("AppSettings:DefaultSTSRetry", DefaultSTSRetry);
     }
 
     public async Task<TokenInfo> GetTokenAsync(IKeyValueSettings settings, CredentialsResult credential)
@@ -39,12 +36,12 @@ public class CredentialTokenProvider : ICredentialTokenProvider
 
         if (string.IsNullOrWhiteSpace(credential.Upn))
         {
-            messages.Add(new Message(Arc4u.ServiceModel.MessageCategory.Technical, Arc4u.ServiceModel.MessageType.Error, "No Username is provided."));
+            messages.Add(new Message(ServiceModel.MessageCategory.Technical, MessageType.Error, "No Username is provided."));
         }
 
         if (string.IsNullOrWhiteSpace(credential.Password))
         {
-            messages.Add(new Message(Arc4u.ServiceModel.MessageCategory.Technical, Arc4u.ServiceModel.MessageType.Warning, "No password is provided."));
+            messages.Add(new Message(ServiceModel.MessageCategory.Technical, MessageType.Warning, "No password is provided."));
         }
 
         messages.LogAndThrowIfNecessary(_logger);
@@ -56,7 +53,7 @@ public class CredentialTokenProvider : ICredentialTokenProvider
 
         // no cache, do a direct call on every calls.
         _logger.Technical().Debug($"Call STS: {authority} for user: {credential.Upn}").Log();
-        return await GetTokenInfoAsync(clientSecret, clientId, tokenEndpoint, scope, credential.Upn, credential.Password).ConfigureAwait(false);
+        return await GetTokenInfoAsync(clientSecret, clientId, tokenEndpoint, scope, credential.Upn!, credential.Password!, authority.RetryInterval ?? DefaultRetryInterval).ConfigureAwait(false);
 
     }
 
@@ -67,8 +64,8 @@ public class CredentialTokenProvider : ICredentialTokenProvider
 
         if (null == settings)
         {
-            messages.Add(new Message(Arc4u.ServiceModel.MessageCategory.Technical,
-                                     Arc4u.ServiceModel.MessageType.Error,
+            messages.Add(new Message(ServiceModel.MessageCategory.Technical,
+                                     MessageType.Error,
                                      "Settings parameter cannot be null."));
             clientId = string.Empty;
             authority = null;
@@ -90,8 +87,8 @@ public class CredentialTokenProvider : ICredentialTokenProvider
 
         if (!settings.Values.ContainsKey(TokenKeys.ClientIdKey))
         {
-            messages.Add(new Message(Arc4u.ServiceModel.MessageCategory.Technical,
-                     Arc4u.ServiceModel.MessageType.Error,
+            messages.Add(new Message(ServiceModel.MessageCategory.Technical,
+                     MessageType.Error,
                      "ClientId is missing. Cannot process the request."));
         }
         _logger.Technical().Debug($"Creating an authentication context for the request.").Log();
@@ -101,7 +98,6 @@ public class CredentialTokenProvider : ICredentialTokenProvider
         scope = !settings.Values.ContainsKey(TokenKeys.Scope) ? "openid" : settings.Values[TokenKeys.Scope];
         return messages;
     }
-
 
     /// <summary>
     /// If a request could not be made, we need to track the number of retries and the delay between them.
@@ -114,10 +110,7 @@ public class CredentialTokenProvider : ICredentialTokenProvider
 
         public override string ToString()
         {
-            if (RetryCount == 0)
-                return "No retries";
-            else
-                return $"Retried {RetryCount} times over {Delay}";
+            return RetryCount == 0 ? "No retries" : $"Retried {RetryCount} times over {Delay}";
         }
     }
 
@@ -126,13 +119,13 @@ public class CredentialTokenProvider : ICredentialTokenProvider
     /// </summary>
     private sealed class HttpRetryMessageHandler : DelegatingHandler
     {
-        private readonly TimeSpan _stsRetry;
+        private readonly TimeSpan _retryInterval;
         private readonly RetryInformation _retryInformation;
 
-        public HttpRetryMessageHandler(HttpMessageHandler innerHandler, TimeSpan stsRetry, RetryInformation retryInformation)
+        public HttpRetryMessageHandler(HttpMessageHandler innerHandler, TimeSpan retryInterval, RetryInformation retryInformation)
             : base(innerHandler)
         {
-            _stsRetry = stsRetry;
+            _retryInterval = retryInterval;
             _retryInformation = retryInformation;
         }
 
@@ -144,13 +137,13 @@ public class CredentialTokenProvider : ICredentialTokenProvider
             for (; ; )
             {
                 HttpResponseMessage? response = null;
-                var delay = TimeSpan.FromMilliseconds(Math.Pow(4, random.NextInt64(1, 6)));
+                var delay = TimeSpan.FromMilliseconds(Math.Pow(4, random.Next(1, 6)));
                 try
                 {
                     response = await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
 
                     // we always return the response if it is successful or we have reached the retry timespan.
-                    if (response.IsSuccessStatusCode || sw.Elapsed >= _stsRetry)
+                    if (response.IsSuccessStatusCode || sw.Elapsed >= _retryInterval)
                     {
                         sw.Stop();
                         _retryInformation.Delay = sw.Elapsed;
@@ -160,14 +153,20 @@ public class CredentialTokenProvider : ICredentialTokenProvider
                     // Use "Retry-After" value, if available. Typically, this is sent with either a 503 (Service Unavailable) or 429 (Too Many Requests):
                     // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
                     if (response.Headers.RetryAfter is not null)
+                    {
                         if (response.Headers.RetryAfter.Date.HasValue)
+                        {
                             delay = response.Headers.RetryAfter.Date.Value - DateTimeOffset.UtcNow;
+                        }
                         else if (response.Headers.RetryAfter.Delta.HasValue)
+                        {
                             delay = response.Headers.RetryAfter.Delta.Value;
+                        }
+                    }
 
                     response.Dispose();
                 }
-                catch when (sw.Elapsed < _stsRetry)
+                catch when (sw.Elapsed < _retryInterval)
                 {
                     // Ignore the exception if we have retries left. But we need to dispose the response even though it's most likely null.
                     response?.Dispose();
@@ -183,12 +182,11 @@ public class CredentialTokenProvider : ICredentialTokenProvider
         }
     }
 
-
-    private async Task<TokenInfo> GetTokenInfoAsync(string? clientSecret, string clientId, Uri tokenEndpoint, string scope, string upn, string pwd)
+    private async Task<TokenInfo> GetTokenInfoAsync(string? clientSecret, string clientId, Uri tokenEndpoint, string scope, string upn, string pwd, TimeSpan retryInterval)
     {
         var retryInformation = new RetryInformation();
         using var handler = new HttpClientHandler { UseDefaultCredentials = true };
-        using var client = new HttpClient(new HttpRetryMessageHandler(handler, _stsRetry, retryInformation));
+        using var client = new HttpClient(new HttpRetryMessageHandler(handler, retryInterval, retryInformation));
 
         try
         {
@@ -202,7 +200,7 @@ public class CredentialTokenProvider : ICredentialTokenProvider
                     };
             if (!string.IsNullOrWhiteSpace(clientSecret))
             {
-                parameters.Add("client_secret", clientSecret);
+                parameters.Add("client_secret", clientSecret!);
             }
             using var content = new FormUrlEncodedContent(parameters);
 
@@ -219,7 +217,7 @@ public class CredentialTokenProvider : ICredentialTokenProvider
                 const int MaxResponseBodyLength = 256;  // arbitrary
                 if (loggedResponseBody != null && loggedResponseBody.Length > MaxResponseBodyLength)
                 {
-                    loggedResponseBody = responseBody.Substring(0, MaxResponseBodyLength) + $"...(response truncated, {loggedResponseBody.Length} total characters)";
+                    loggedResponseBody = $"{responseBody.Substring(0, MaxResponseBodyLength)}...(response truncated, {loggedResponseBody.Length} total characters)";
                 }
 
                 var logger = _logger.Technical().Error($"Token endpoint for {upn} returned {response.StatusCode} after {retryInformation}: {loggedResponseBody}");
@@ -257,11 +255,11 @@ public class CredentialTokenProvider : ICredentialTokenProvider
                             error_description = "No error description";
                         }
 
-                        throw new AppException(new Message(Arc4u.ServiceModel.MessageCategory.Technical, MessageType.Error, tokenErrorCode, response.StatusCode.ToString(), $"{error_description} ({upn}, {retryInformation}"));
+                        throw new AppException(new Message(ServiceModel.MessageCategory.Technical, MessageType.Error, tokenErrorCode, response.StatusCode.ToString(), $"{error_description} ({upn}, {retryInformation}"));
                     }
                 }
                 // if we can't write a better exception, issue a more general one
-                throw new AppException(new Message(Arc4u.ServiceModel.MessageCategory.Technical, MessageType.Error, "TokenError", response.StatusCode.ToString(), $"{response.StatusCode} occured while requesting a token for {upn} ({retryInformation})"));
+                throw new AppException(new Message(ServiceModel.MessageCategory.Technical, MessageType.Error, "TokenError", response.StatusCode.ToString(), $"{response.StatusCode} occured while requesting a token for {upn} ({retryInformation})"));
             }
 
             // at this point, we *must* have a valid Json response. The values are a mixture of strings and numbers, so we deserialize the JsonElements
@@ -284,7 +282,7 @@ public class CredentialTokenProvider : ICredentialTokenProvider
         catch (Exception ex)
         {
             _logger.Technical().Exception(ex).Log();
-            throw new AppException(new Message(Arc4u.ServiceModel.MessageCategory.Technical, MessageType.Error, "Trust", "Rejected", ex.Message));
+            throw new AppException(new Message(ServiceModel.MessageCategory.Technical, MessageType.Error, "Trust", "Rejected", ex.Message));
         }
     }
 }
